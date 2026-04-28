@@ -187,7 +187,7 @@ async def trigger_workers(request: dict):
                 setattr(config.experiment, field, request[field])
 
         # ── 3. Generate periods ────────────────────────────────────────────
-        train_periods = get_train_periods(request["train_start"], request["train_end"])
+        train_periods = get_train_periods(request["train_start"], request["train_end"], config)
 
         if not train_periods:
             raise HTTPException(
