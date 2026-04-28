@@ -2,4 +2,4 @@ fastapi
 uvicorn[standard]
 pandas-market-calendars
 pandas
-google-cloud
+google-cloud-pubsub
