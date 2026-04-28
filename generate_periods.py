@@ -119,7 +119,7 @@ def generate_test_periods(start, end):
     return periods
 
 def get_train_periods(train_start, train_end, config):
-    start, end = '2020-08-31', '2023-06-30'
+    start, end = '2015-03-31', '2020-12-30'
     train_periods = generate_test_periods(start, end)
     train_periods = [[period[0], period[1]] for period in train_periods]
 
@@ -196,6 +196,8 @@ def get_train_periods(train_start, train_end, config):
             trading_calendar=config.experiment.trading_calendar
         ) for (train_start_date, train_end_date) in train_periods
     ])
+
+    print(periods)
 
     train_periods = []
 
