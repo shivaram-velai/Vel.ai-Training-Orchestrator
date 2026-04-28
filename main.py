@@ -68,7 +68,7 @@ def build_worker_payloads(request: dict, train_periods: list) -> list[dict]:
 
     for period in train_periods:
         # Period id from test_start for unique experiment naming
-        period_id = period.get("test_start", "unknown").replace("-", "")
+        period_id = period[-2].replace("-", "")
 
         payloads.append({
             # ── Required worker fields ──────────────────────────────────
@@ -196,6 +196,7 @@ async def trigger_workers(request: dict):
             )
 
         logger.info(f"Generated {len(train_periods)} period(s) — dispatching to Pub/Sub ...\n")
+        logger.info(f"Train Periods are: {train_periods}")
 
         # ── 4. Build payloads ──────────────────────────────────────────────
         payloads = build_worker_payloads(request, train_periods)
