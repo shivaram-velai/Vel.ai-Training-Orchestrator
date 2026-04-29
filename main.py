@@ -65,6 +65,7 @@ def build_worker_payloads(request: dict, train_periods: list) -> list[dict]:
     """
     base_experiment_name = request["experiment_name"]
     payloads = []
+    reserved_keys = {"experiment_name", "prediction_horizon", "train_test_period", "_meta"}
 
     for period in train_periods:
         # Period id from test_start for unique experiment naming
@@ -76,6 +77,9 @@ def build_worker_payloads(request: dict, train_periods: list) -> list[dict]:
             "prediction_horizon" : request["prediction_horizon"],
             "train_test_period"  : period,   # {train_start, train_end, test_start, test_end}
 
+             # ── Pass-through fields (everything else from request) ──────
+            **{k: v for k, v in request.items() if k not in reserved_keys},
+            
             # ── Orchestration metadata (for logging/debugging) ──────────
             "_meta": {
                 "period_id"    : period_id,
