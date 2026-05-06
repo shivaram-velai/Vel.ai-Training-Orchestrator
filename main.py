@@ -220,6 +220,7 @@ def trigger_cloud_run_job(
         run_v2.EnvVar(name="GCP_PROJECT",  value=GCP_PROJECT),
         run_v2.EnvVar(name="GCS_BUCKET",   value=GCS_BUCKET),
         run_v2.EnvVar(name="MANIFEST_URI", value=manifest_uri),
+        run_v2.EnvVar(name="MLFLOW_TRACKING_URI", value=os.environ.get("MLFLOW_TRACKING_URI", "")),
     ]
 
     task_template = run_v2.TaskTemplate(
