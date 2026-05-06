@@ -3,5 +3,5 @@ uvicorn[standard]
 pandas-market-calendars
 pandas
 google-cloud-pubsub
-googld-cloud-storage
+google-cloud-storage
 google-cloud-run
