@@ -1,7 +1,7 @@
 """
 orchestrator/main.py
 ====================
-Cloud Run Service – Orchestrator
+Cloud Run Service – Orchestrator (Cloud Run Jobs architecture)
 
 Receives an HTTP POST, generates walk-forward periods, then triggers a
 Cloud Run Job where each period runs as a parallel task with its own
@@ -11,7 +11,7 @@ Flow:
     POST /create-job
         │
         ▼
-    generate N periods
+    generate N periods  (using Config overrides, same as Pub/Sub version)
         │
         ▼
     upload periods manifest → GCS  (workers read by CLOUD_RUN_TASK_INDEX)
@@ -43,7 +43,6 @@ import traceback
 import uuid
 from datetime import datetime
 
-import requests
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from google.cloud import run_v2, storage
@@ -66,7 +65,7 @@ app = FastAPI()
 GCP_PROJECT     = os.environ["GCP_PROJECT"]
 GCP_REGION      = os.environ.get("GCP_REGION", "europe-west1")
 GCS_BUCKET      = os.environ["GCS_BUCKET"]
-WORKER_IMAGE    = os.environ["WORKER_IMAGE"]   # e.g. europe-west1-docker.pkg.dev/proj/repo/xgb-worker:latest
+WORKER_IMAGE    = os.environ["WORKER_IMAGE"]
 WORKER_CPU      = os.environ.get("WORKER_CPU", "8")
 WORKER_MEMORY   = os.environ.get("WORKER_MEMORY", "32Gi")
 WORKER_SA_EMAIL = os.environ["WORKER_SA_EMAIL"]
@@ -93,22 +92,73 @@ async def health_check():
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+def build_config(request: dict) -> Config:
+    """
+    Build a Config object from the request, applying all optional overrides.
+    Mirrors the Pub/Sub version's config building block exactly.
+    """
+    config = Config()
+    config.experiment.prediction_horizon = request["prediction_horizon"]
+
+    optional_fields = [
+        "test_period_months",
+        "validation_period_months",
+        "validation_offset_months",
+        "test_period_start_offset_months",
+        "trading_calendar",
+    ]
+    for field in optional_fields:
+        if request.get(field) is not None:
+            setattr(config.experiment, field, request[field])
+
+    return config
+
+
 def build_task_payloads(request: dict, train_periods: list) -> list[dict]:
     """
-    Build one payload dict per period.
-    Stored in GCS as a manifest; each worker task reads its own entry
-    using CLOUD_RUN_TASK_INDEX.
+    Build one payload dict per period for the GCS manifest.
+
+    Mirrors the Pub/Sub version:
+      - experiment_name      : base name only (no per-period suffix, consistent
+                               with Pub/Sub version's f"{base_experiment_name}")
+      - prediction_horizon   : from request
+      - train_test_period    : the period tuple/dict
+      - pass-through fields  : everything else in request that isn't a reserved key
+                               (same **{k: v ...} spread as Pub/Sub version)
+      - _meta                : orchestration metadata
+
+    Period ID extraction uses period[-2] (index into the period tuple/list)
+    to match the Pub/Sub version's `period[-2].replace("-", "")`.
+    If your periods are dicts, falls back to period["test_start"].
     """
-    run_id = os.environ.get("CLOUD_RUN_EXECUTION", str(uuid.uuid4())[:8])
+    reserved_keys = {
+        "experiment_name", "prediction_horizon", "train_test_period", "_meta",
+        # orchestrator-only fields — don't forward to workers
+        "train_start", "train_end",
+    }
+
+    run_id    = os.environ.get("CLOUD_RUN_EXECUTION", str(uuid.uuid4())[:8])
     base_name = request["experiment_name"]
-    payloads = []
+    payloads  = []
 
     for period in train_periods:
-        period_id = period.get("test_start", "unknown").replace("-", "")
+        # Match Pub/Sub version: period[-2] for list/tuple, fallback for dict
+        if isinstance(period, (list, tuple)):
+            period_id = str(period[-2]).replace("-", "")
+        else:
+            period_id = period.get("test_start", "unknown").replace("-", "")
+
         payloads.append({
-            "experiment_name"    : f"{base_name}_{period_id}",
+            # ── Required worker fields ──────────────────────────────────
+            "experiment_name"    : base_name,           # no suffix, same as Pub/Sub version
             "prediction_horizon" : request["prediction_horizon"],
             "train_test_period"  : period,
+
+            # ── Pass-through: all extra request fields ──────────────────
+            # Mirrors: **{k: v for k, v in request.items() if k not in reserved_keys}
+            **{k: v for k, v in request.items() if k not in reserved_keys},
+
+            # ── Orchestration metadata ──────────────────────────────────
             "_meta": {
                 "period_id"    : period_id,
                 "dispatched_at": datetime.utcnow().isoformat(),
@@ -121,11 +171,10 @@ def build_task_payloads(request: dict, train_periods: list) -> list[dict]:
 
 def upload_manifest(payloads: list[dict], job_name: str) -> str:
     """
-    Upload the periods manifest to GCS.
-    Returns the GCS URI so workers can read it.
+    Upload the full periods manifest to GCS as a JSON array.
+    Each worker task reads its own entry using CLOUD_RUN_TASK_INDEX.
 
-    Layout: gs://{bucket}/manifests/{job_name}/manifest.json
-    The file is a JSON array; worker reads index CLOUD_RUN_TASK_INDEX.
+    GCS layout: gs://{GCS_BUCKET}/manifests/{job_name}/manifest.json
     """
     gcs_path = f"manifests/{job_name}/manifest.json"
     client   = storage.Client()
@@ -142,40 +191,22 @@ def upload_manifest(payloads: list[dict], job_name: str) -> str:
     return gcs_uri
 
 
-def build_env_overrides(request: dict) -> dict:
-    """
-    Collect optional config fields to pass to workers as env vars.
-    Workers read these alongside MANIFEST_URI and CLOUD_RUN_TASK_INDEX.
-    """
-    overrides = {}
-    optional_fields = [
-        "test_period_months",
-        "validation_period_months",
-        "validation_offset_months",
-        "test_period_start_offset_months",
-        "trading_calendar",
-    ]
-    for field in optional_fields:
-        if request.get(field) is not None:
-            # Env vars are strings; worker casts back to correct type
-            overrides[field.upper()] = str(request[field])
-    return overrides
-
-
 def trigger_cloud_run_job(
-    job_name    : str,
-    payloads    : list[dict],
-    manifest_uri: str,
-    env_overrides: dict,
+    job_name     : str,
+    payloads     : list[dict],
+    manifest_uri : str,
 ) -> str:
     """
     Create (or update) a Cloud Run Job and immediately trigger an execution.
 
-    Each task gets:
-        CLOUD_RUN_TASK_INDEX  – injected by GCP (0-based index into manifest)
-        MANIFEST_URI          – GCS path to the full periods manifest
-        GCS_BUCKET            – for writing results
-        + any optional config overrides
+    All task config is in the manifest — no env var overrides needed here
+    because pass-through fields are already baked into each manifest entry
+    (handled in build_task_payloads via the **{...} spread).
+
+    Each task receives from GCP automatically:
+        CLOUD_RUN_TASK_INDEX  – 0-based index into the manifest array
+        CLOUD_RUN_TASK_COUNT  – total number of tasks
+        CLOUD_RUN_EXECUTION   – execution ID for tracing
 
     Returns the execution name.
     """
@@ -184,20 +215,13 @@ def trigger_cloud_run_job(
     job_path   = f"{parent}/jobs/{job_name}"
     task_count = len(payloads)
 
-    # ── Base env vars every task needs ────────────────────────────────────
-    base_env = {
-        "GCP_PROJECT" : GCP_PROJECT,
-        "GCS_BUCKET"  : GCS_BUCKET,
-        "MANIFEST_URI": manifest_uri,
-    }
-    all_env = {**base_env, **env_overrides}
-
+    # Only infrastructure env vars go here — all business config is in manifest
     env_vars = [
-        run_v2.EnvVar(name=k, value=v)
-        for k, v in all_env.items()
+        run_v2.EnvVar(name="GCP_PROJECT",  value=GCP_PROJECT),
+        run_v2.EnvVar(name="GCS_BUCKET",   value=GCS_BUCKET),
+        run_v2.EnvVar(name="MANIFEST_URI", value=manifest_uri),
     ]
 
-    # ── Task template ─────────────────────────────────────────────────────
     task_template = run_v2.TaskTemplate(
         containers=[
             run_v2.Container(
@@ -216,30 +240,29 @@ def trigger_cloud_run_job(
         timeout=f"{JOB_TIMEOUT}s",
     )
 
-    # ── Job definition ────────────────────────────────────────────────────
     job = run_v2.Job(
         template=run_v2.ExecutionTemplate(
-            task_count  =task_count,
-            parallelism =task_count,   # all tasks fire simultaneously
-            template    =task_template,
+            task_count =task_count,
+            parallelism=task_count,   # all tasks fire simultaneously
+            template   =task_template,
         )
     )
 
-    # ── Create or update the job ──────────────────────────────────────────
+    # Create or update
     try:
-        existing = client.get_job(name=job_path)
+        client.get_job(name=job_path)
         logger.info(f"Job {job_name} exists — updating ...")
         operation = client.update_job(job=run_v2.Job(name=job_path, **job))
-        operation.result()  # wait for update to complete
+        operation.result()
     except Exception:
         logger.info(f"Creating new job: {job_name}")
         operation = client.create_job(parent=parent, job=job, job_id=job_name)
-        operation.result()  # wait for creation
+        operation.result()
 
-    # ── Trigger execution ─────────────────────────────────────────────────
-    logger.info(f"Triggering execution of job {job_name} with {task_count} parallel tasks ...")
+    # Trigger — don't wait for completion, return immediately
+    logger.info(f"Triggering {job_name} with {task_count} parallel tasks ...")
     exec_operation = client.run_job(name=job_path)
-    execution      = exec_operation.metadata   # don't wait — fire and return
+    execution      = exec_operation.metadata
 
     execution_name = getattr(execution, "name", job_name)
     logger.info(f"Execution triggered → {execution_name}")
@@ -252,28 +275,18 @@ async def trigger_workers(request: Request):
     """
     Main orchestration endpoint.
 
-    1. Validates the request.
-    2. Generates walk-forward periods.
-    3. Uploads a manifest JSON to GCS.
-    4. Creates + triggers a Cloud Run Job where:
-           task_count  = number of periods
-           parallelism = number of periods   (all run simultaneously)
-       Each task reads its period from the manifest using CLOUD_RUN_TASK_INDEX.
-
     Required body fields:
         experiment_name       : str
         prediction_horizon    : int
         train_start           : str  "YYYY-MM-DD"
         train_end             : str  "YYYY-MM-DD"
 
-    Optional body fields:
+    Optional body fields (forwarded to every worker via manifest pass-through):
         test_period_months                : int
         validation_period_months          : int
         validation_offset_months          : int
         test_period_start_offset_months   : int
         trading_calendar                  : str
-        worker_cpu                        : str  (overrides WORKER_CPU env var)
-        worker_memory                     : str  (overrides WORKER_MEMORY env var)
     """
     try:
         body    = await request.body()
@@ -291,8 +304,12 @@ async def trigger_workers(request: Request):
         logger.info(f"  Horizon : {payload['prediction_horizon']}")
         logger.info("=" * 60)
 
-        # ── 2. Generate periods ────────────────────────────────────────────
-        train_periods = get_train_periods(payload["train_start"], payload["train_end"])
+        # ── 2. Build config (mirrors Pub/Sub version exactly) ──────────────
+        config = build_config(payload)
+
+        # ── 3. Generate periods (pass config, same as Pub/Sub version) ─────
+        train_periods = get_train_periods(payload["train_start"], payload["train_end"], config)
+
         if not train_periods:
             raise HTTPException(
                 status_code=400,
@@ -300,28 +317,26 @@ async def trigger_workers(request: Request):
             )
 
         logger.info(f"Generated {len(train_periods)} period(s)")
+        logger.info(f"Train periods: {train_periods}")
 
-        # ── 3. Build task payloads ─────────────────────────────────────────
+        # ── 4. Build task payloads ─────────────────────────────────────────
         task_payloads = build_task_payloads(payload, train_periods)
 
-        # ── 4. Upload manifest to GCS ──────────────────────────────────────
-        # Job name: sanitised experiment name + short timestamp
+        # ── 5. Upload manifest to GCS ──────────────────────────────────────
         timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
         job_name  = f"{payload['experiment_name'].lower().replace('_', '-')}-{timestamp}"
-        job_name  = job_name[:49]  # Cloud Run Job name max length
+        job_name  = job_name[:49]  # Cloud Run Job name max 49 chars
 
-        manifest_uri  = upload_manifest(task_payloads, job_name)
-        env_overrides = build_env_overrides(payload)
+        manifest_uri = upload_manifest(task_payloads, job_name)
 
-        # ── 5. Trigger Cloud Run Job ───────────────────────────────────────
+        # ── 6. Trigger Cloud Run Job ───────────────────────────────────────
         execution_name = trigger_cloud_run_job(
             job_name     = job_name,
             payloads     = task_payloads,
             manifest_uri = manifest_uri,
-            env_overrides= env_overrides,
         )
 
-        # ── 6. Respond immediately ─────────────────────────────────────────
+        # ── 7. Response ────────────────────────────────────────────────────
         logger.info("── Dispatch complete ─────────────────────────────────")
         logger.info(f"  Job       : {job_name}")
         logger.info(f"  Execution : {execution_name}")
