@@ -1,8 +1,9 @@
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from bisect import bisect_left, bisect_right
+from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
-from typing import Union, List
+from typing import Union, List, Optional
 import pandas_market_calendars as mcal
 
 def add_trading_days(
@@ -25,14 +26,15 @@ def add_trading_days(
     return pd.to_datetime(result)
 
 def generate_full_periods_train_test_valid(
-        train_start_date: str, 
+        train_start_date: str,
         train_end_date: str,
         test_period_start_offset_months: int,
-        test_period_months: int, 
+        test_period_months: int,
         validation_period_months: int,
         validation_offset_months: int=0,
         prediction_horizon: int=7,
-        trading_calendar: str='NYSE'
+        trading_calendar: str='NYSE',
+        trading_dates: Optional[pd.DatetimeIndex]=None,
     ):
     """
     Generate full periods for training, validation, and testing.
@@ -62,11 +64,11 @@ def generate_full_periods_train_test_valid(
         test_start_date = end_dt + relativedelta(months=test_period_start_offset_months)
         test_end_date = test_start_date + relativedelta(months=test_period_months)
     else:
-        # Load trading calendar dates
-        nyse = mcal.get_calendar(trading_calendar)
-        schedule = nyse.schedule(start_date='2014-01-01', end_date='2030-12-31')
-        trading_dates = schedule.index
-        
+        if trading_dates is None:
+            nyse = mcal.get_calendar(trading_calendar)
+            schedule = nyse.schedule(start_date='2014-01-01', end_date='2030-12-31')
+            trading_dates = schedule.index
+
         test_start_date = add_trading_days(
             pd.to_datetime([train_end_date]),
             horizon=prediction_horizon,
@@ -119,11 +121,8 @@ def generate_test_periods(start, end):
     return periods
 
 def get_train_periods(train_start, train_end, config):
-    start, end = '2015-03-31', '2020-12-30'
-    train_periods = generate_test_periods(start, end)
-    train_periods = [[period[0], period[1]] for period in train_periods]
-
-    horizon = config.experiment.prediction_horizon
+    dyn = generate_test_periods('2015-03-31', '2025-12-30')
+    dyn_train_periods = [[p[0], p[1]] for p in dyn]
 
     prev = [
         ['2015-03-31', '2015-12-31'],
@@ -183,31 +182,61 @@ def get_train_periods(train_start, train_end, config):
         ['2015-03-31', '2020-05-31'],
     ]
 
-    train_periods = prev + train_periods
+    # Combined list is sorted ascending by train_end (prev tops out at 2020-05-31,
+    # dynamic starts at 2020-06-30), enabling binary-search pre-filtering.
+    all_base_periods = prev + dyn_train_periods
 
-    periods = list([
+    offset      = config.experiment.test_period_start_offset_months
+    test_months = config.experiment.test_period_months
+    horizon     = config.experiment.prediction_horizon
+
+    train_start_dt = datetime.strptime(train_start, '%Y-%m-%d')
+    train_end_dt   = datetime.strptime(train_end,   '%Y-%m-%d')
+
+    # Compute bounds on train_end_date that can possibly produce a test window
+    # overlapping [train_start, train_end], then bisect the sorted list so we
+    # only call generate_full_periods_train_test_valid on candidates.
+    if offset > 0:
+        # test_start = train_end_date + offset months
+        # test_end   = test_start + test_months months
+        # need: test_end >= train_start  →  train_end_date >= train_start - offset - test_months
+        # need: test_start <= train_end  →  train_end_date <= train_end - offset
+        lo = train_start_dt - relativedelta(months=offset + test_months)
+        hi = train_end_dt   - relativedelta(months=offset)
+        trading_dates = None
+    else:
+        # test_start = train_end_date + H trading days  (~H*1.5 calendar days max)
+        # need: test_end >= train_start  →  train_end_date >= train_start - test_months - slack
+        # need: test_start <= train_end  →  train_end_date <= train_end  (safe upper bound)
+        slack = timedelta(days=int(horizon * 1.5) + 5)
+        lo = train_start_dt - relativedelta(months=test_months) - slack
+        hi = train_end_dt
+
+        # Load trading calendar once for all candidate calls.
+        nyse = mcal.get_calendar(config.experiment.trading_calendar)
+        trading_dates = nyse.schedule(start_date='2014-01-01', end_date='2030-12-31').index
+
+    lo_str = lo.strftime('%Y-%m-%d')
+    hi_str = hi.strftime('%Y-%m-%d')
+
+    train_ends = [p[1] for p in all_base_periods]
+    left  = bisect_left(train_ends,  lo_str)
+    right = bisect_right(train_ends, hi_str)
+    candidates = all_base_periods[left:right]
+
+    periods = [
         generate_full_periods_train_test_valid(
-            train_start_date, train_end_date,
-            test_period_months=config.experiment.test_period_months,
+            ts, te,
+            test_period_months=test_months,
             validation_period_months=config.experiment.validation_period_months,
             validation_offset_months=config.experiment.validation_offset_months,
-            test_period_start_offset_months=config.experiment.test_period_start_offset_months,
-            prediction_horizon=config.experiment.prediction_horizon,
-            trading_calendar=config.experiment.trading_calendar
-        ) for (train_start_date, train_end_date) in train_periods
-    ])
+            test_period_start_offset_months=offset,
+            prediction_horizon=horizon,
+            trading_calendar=config.experiment.trading_calendar,
+            trading_dates=trading_dates,
+        )
+        for (ts, te) in candidates
+    ]
 
-    print(periods)
-
-    train_periods = []
-
-    for period in periods:
-        test_start = period[-2]
-        test_end   = period[-1]
-
-        # ---- Overlap condition ----
-        if test_end >= train_start and test_start <= train_end:
-            train_periods.append(period)
-
-    return train_periods
+    return [p for p in periods if p[-1] >= train_start and p[-2] <= train_end]
         
