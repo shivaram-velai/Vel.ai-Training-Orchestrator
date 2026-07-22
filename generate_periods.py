@@ -61,8 +61,12 @@ def generate_full_periods_train_test_valid(
 
     # Test
     if test_period_start_offset_months > 0:
-        test_start_date = end_dt + relativedelta(months=test_period_start_offset_months)
-        test_end_date = test_start_date + relativedelta(months=test_period_months)
+        test_start_date = (
+            pd.Timestamp(end_dt) + pd.offsets.MonthEnd(test_period_start_offset_months)
+        ).to_pydatetime()
+        test_end_date = (
+            pd.Timestamp(test_start_date) + pd.offsets.MonthEnd(test_period_months)
+        ).to_pydatetime()
     else:
         if trading_dates is None:
             nyse = mcal.get_calendar(trading_calendar)

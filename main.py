@@ -317,8 +317,17 @@ async def trigger_workers(request: Request):
                 detail=f"No periods for range {payload['train_start']} → {payload['train_end']}",
             )
 
+        period_keys = [
+            "train_start", "train_end",
+            "internal_train_start", "internal_train_end",
+            "validation_start", "validation_end",
+            "test_start", "test_end",
+        ]
+        formatted_periods = [dict(zip(period_keys, p)) for p in train_periods]
+
         logger.info(f"Generated {len(train_periods)} period(s)")
-        logger.info(f"Train periods: {train_periods}")
+        for i, p in enumerate(formatted_periods):
+            logger.info(f"  Period {i}: {p}")
 
         # ── 4. Build task payloads ─────────────────────────────────────────
         task_payloads = build_task_payloads(payload, train_periods)
@@ -353,6 +362,7 @@ async def trigger_workers(request: Request):
                 "execution_name": execution_name,
                 "total_periods" : len(task_payloads),
                 "parallelism"   : len(task_payloads),
+                "train_periods" : formatted_periods,
                 "manifest_uri"  : manifest_uri,
                 "dispatched_at" : datetime.utcnow().isoformat(),
             },
